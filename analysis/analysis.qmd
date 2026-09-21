@@ -1,0 +1,454 @@
+---
+title: "Urban Circulators and Home Values: A Revisited Difference-in-Differences Analysis"
+subtitle: "Extending a 2023 undergraduate paper with panel fixed effects, clustered standard errors, and an event-study design"
+author: "Quin Rizer"
+date: today
+format:
+  html:
+    toc: true
+    embed-resources: true
+    code-fold: show
+execute:
+  warning: false
+  message: false
+editor:
+  markdown:
+    wrap: 72
+---
+
+## Background
+
+In 2023 I wrote a paper (`Final Paper.docx` / `regression.R`, both in
+`/legacy` in this repository) asking whether St. Louis's Delmar Loop
+Trolley raised home values in the zip codes it runs through (63130,
+63112), relative to three comparison zips (63114, 63133, 63108) chosen
+for similar geography and demographics. That analysis ran a separate
+`lm(HomeValue ~ time + treated + did)` for each of several candidate
+treatment dates (announcement in 2010, construction start in 2015,
+opening in 2018) and found no statistically significant increase in home
+values under any plausible treatment date -- the one specification that
+*did* come back significant relied on a 20-year window and was flagged
+in the paper itself as likely confounded by unrelated City/County policy
+differences over that span.
+
+This notebook revisits that question two ways:
+
+1.  **An improved version of the original St. Louis model** -- same
+    treated/comparison zips, same preferred treatment date (the
+    trolley's actual opening, since that's the least ambiguous and least
+    confounded of the three candidate dates), but with two changes
+    standard in applied DiD work that the original didn't have: zip and
+    time fixed effects instead of simple dummy variables, and standard
+    errors clustered by zip (monthly home values within a zip are highly
+    autocorrelated, so un-clustered OLS standard errors understate
+    uncertainty).
+2.  **A pooled model across all three circulators** this project now
+    covers -- St. Louis, the KC Streetcar, and the Cincinnati Connector
+    -- to ask the broader question the single-city design can't: do
+    urban circulators raise home values *in general*, not just in one
+    city.
+
+A caveat up front: part 2's comparison zips for Kansas City and
+Cincinnati have not been vetted with anything like the care the original
+paper put into its St. Louis control group. That vetting is addressed
+below, but it's a quick, county-level check -- not a demographic or
+geographic argument on the level of the original paper. Part 2's results
+should be read with that in mind.
+
+```{r setup}
+library(tidyverse)
+library(fixest)
+library(broom)
+library(scales)
+
+# The full Zillow ZHVI export (~120MB, every US zip code) is too large to
+# commit to this repo. This analysis only ever touches 16 zip codes
+# across three cities, so ../data/zip_data_subset.csv -- the same
+# columns, just those 16 rows -- is a drop-in replacement. See
+# ../data/README.md for provenance and how to regenerate it (or get the
+# full national file) if you need more zips than this.
+zip_data_raw <- read_csv("../data/zip_data_subset.csv", show_col_types = FALSE)
+```
+
+## Building an event-time panel
+
+Each city's circulator opened on a different calendar date, so pooling
+them requires a shared clock: *event time*, measured in months relative
+to that city's own opening date, rather than calendar time.
+`build_event_panel()` below takes a city's treated and comparison zips
+and its opening date, reshapes the wide Zillow export into zip-month
+rows, computes each row's distance from the opening date in months, and
+restricts the panel to a fixed window on either side of it.
+
+```{r build-panel-fn}
+build_event_panel <- function(zip_data, treated_zips, comparison_zips, opening_date,
+                               window_months = 36, city_label) {
+  zips <- c(treated_zips, comparison_zips)
+  date_cols <- zip_data %>%
+    select(matches("^\\d{4}-\\d{2}-\\d{2}$")) %>%
+    names()
+  opening_date <- as.Date(opening_date)
+
+  zip_data %>%
+    filter(RegionName %in% zips) %>%
+    select(RegionName, City, CountyName, all_of(date_cols)) %>%
+    pivot_longer(cols = all_of(date_cols), names_to = "date_str", values_to = "HomeValue") %>%
+    mutate(
+      Date = as.Date(date_str),
+      RegionName = as.character(RegionName),
+      treated = as.integer(RegionName %in% treated_zips),
+      # Whole-month distance from the opening date -- simple integer
+      # arithmetic on year/month rather than lubridate period math, which
+      # is more predictable across month-end dates like these.
+      event_month = (year(Date) - year(opening_date)) * 12 +
+        (month(Date) - month(opening_date))
+    ) %>%
+    filter(abs(event_month) <= window_months, !is.na(HomeValue)) %>%
+    mutate(post = as.integer(event_month >= 0), city = city_label)
+}
+```
+
+## Part 1: St. Louis, revisited
+
+Treated zips (63130, 63112) and comparison zips (63114, 63133, 63108)
+match my original paper exactly -- these are also the correct zips going
+forward for this project; the dashboard's `stl_trend_zips` previously
+had a transcription typo (63113 instead of 63114) which has been fixed
+to match. Window: 36 months on either side of the November 2018 opening,
+matching the paper's own preferred specification.
+
+```{r stl-panel}
+stl_treated <- c("63130", "63112")
+stl_comparison <- c("63114", "63133", "63108")
+
+stl_panel <- build_event_panel(
+  zip_data_raw, stl_treated, stl_comparison,
+  opening_date = "2018-11-30", window_months = 36, city_label = "St. Louis"
+)
+```
+
+### Two-way fixed-effects DiD
+
+```{r stl-model}
+stl_fe <- feols(HomeValue ~ treated:post | RegionName + Date, cluster = ~RegionName, data = stl_panel)
+etable(stl_fe)
+```
+
+Zip fixed effects absorb each zip's own baseline home value; date fixed
+effects absorb whatever was happening to home values region-wide (or
+nationally) in a given month. `treated:post` is the DiD estimate itself,
+and standard errors are clustered by zip -- unlike the original `lm()`,
+which had neither.
+
+### Event study: does parallel trends actually hold?
+
+The original paper checked parallel trends by eye ("it seems visually
+that..."). This estimates a separate treated-vs-comparison gap for every
+month relative to the opening (holding the month right before opening,
+`event_month = -1`, as the reference), so pre-trends can be read off the
+plot directly instead of inferred from a line chart.
+
+```{r stl-event-study}
+stl_es <- feols(HomeValue ~ i(event_month, treated, ref = -1) | RegionName + Date,
+                 cluster = ~RegionName, data = stl_panel)
+iplot(stl_es,
+      main = "St. Louis: Event-Study Estimates (Loop Trolley, Nov 2018)",
+      xlab = "Months relative to opening", ylab = "Treated - comparison gap (USD)")
+```
+
+If the pre-period (negative `event_month`) coefficients sit close to
+zero with confidence intervals that comfortably span it, that's real
+evidence for parallel trends -- not just a visual impression. If they
+don't, that's worth reporting honestly rather than dropping the check.
+
+## Part 2: Pooling all three circulators
+
+### A quick vetting pass on the comparison zips
+
+St. Louis's comparison zips were chosen in the original paper for
+matching geography and demographics, with an explicit check that the
+group balances City vs. County jurisdiction against the treated pair.
+Kansas City's and Cincinnati's comparison zips, by contrast, were
+originally picked for the project's dashboard trend chart -- a visual
+choice, not an econometric one. A light check against each zip's
+`City`/`CountyName` fields:
+
+- **Kansas City** treated zips (64106, 64108, 64105) are all Jackson
+  County. The dashboard's original comparison list included 64116, which
+  is Clay County -- a different jurisdiction, exactly the kind of
+  confound the original paper flagged for its own invalid long-window
+  model. Swapped for **64111** (Westport / Country Club Plaza), which is
+  Jackson County and, like the original paper's choice of the Central
+  West End (63108) in St. Louis, is a walkable/mixed-use district that
+  was *not* served by the streetcar -- the same logic, applied to Kansas
+  City.
+- **Cincinnati** treated zip (45202) and comparison zips (45203, 45212,
+  45219, 45206) are all Hamilton County. 45212 is technically Norwood, a
+  separate incorporated city within the county, not Cincinnati proper --
+  a milder version of the same issue, and one I'm choosing to leave as a
+  disclosed limitation rather than resolve here.
+
+This is not the level of scrutiny the original St. Louis group received.
+Treat Part 2 as a useful extension, not a replacement for Part 1.
+
+```{r pooled-panel}
+kc_treated <- c("64106", "64108", "64105")
+kc_comparison <- c("64111", "64124", "64127") # 64116 (Clay County) swapped for 64111 (Jackson County)
+
+cincy_treated <- c("45202")
+cincy_comparison <- c("45203", "45212", "45219", "45206")
+
+kc_panel <- build_event_panel(
+  zip_data_raw, kc_treated, kc_comparison,
+  opening_date = "2016-05-31", window_months = 36, city_label = "Kansas City"
+)
+cincy_panel <- build_event_panel(
+  zip_data_raw, cincy_treated, cincy_comparison,
+  opening_date = "2016-09-30", window_months = 36, city_label = "Cincinnati"
+)
+
+# Each city's treated/comparison zips are entirely distinct from the other
+# cities' (no physical zip code appears in more than one city's panel), so
+# stacking these three is simpler than the general "stacked DiD" literature
+# deals with -- there's no shared pool of potential comparison units being
+# reused across cohorts with different treatment timing, which is the
+# problem that design was built to solve. Here it's just three independent
+# local comparisons pooled into one regression for power, sharing an
+# event-time clock instead of a calendar-time one.
+pooled_panel <- bind_rows(stl_panel, kc_panel, cincy_panel) %>%
+  mutate(
+    zip_id = paste(city, RegionName, sep = "_"), # zip codes don't collide across these states, but this keeps the clustering unit unambiguous
+    city = factor(city)
+  )
+```
+
+### Pooled two-way fixed-effects DiD
+
+`city^event_month` creates one fixed effect per (city, event-month)
+combination -- the pooled equivalent of the date fixed effect in Part 1,
+since the three cities aren't on the same calendar clock.
+
+```{r pooled-model}
+pooled_fe <- feols(HomeValue ~ treated:post | zip_id + city^event_month,
+                    cluster = ~zip_id, data = pooled_panel)
+etable(stl_fe, pooled_fe, headers = c("St. Louis only", "Pooled (3 cities)"))
+```
+
+### Pooled event study
+
+```{r pooled-event-study}
+pooled_es <- feols(HomeValue ~ i(event_month, treated, ref = -1) | zip_id + city^event_month,
+                    cluster = ~zip_id, data = pooled_panel)
+iplot(pooled_es,
+      main = "Pooled Event-Study Estimates, All Three Circulators",
+      xlab = "Months relative to each city's own opening date", ylab = "Treated - comparison gap (USD)")
+```
+
+The pooled event study shows a smooth, roughly linear pre-trend -- the
+treated/comparison gap starts around -\$20k three years before opening
+and closes to near zero right at treatment, rather than sitting flat.
+That's a parallel-trends violation, not noise: the confidence intervals
+in the early pre-period don't come close to including the later
+pre-period estimates. Two explanations are worth distinguishing before
+taking the pooled DiD coefficient at face value: (1) a genuine
+anticipation effect, where nearby home values start rising as a
+circulator project becomes real, well before it opens, or (2) the
+comparison zips for at least one city are simply a worse match than St.
+Louis's -- already on a different appreciation trajectory for reasons
+that have nothing to do with the circulator. St. Louis's own event study
+(above) is comparatively flat and noisy, with no equivalent monotonic
+drift, which points toward (2): this pre-trend is more likely coming
+from Kansas City and/or Cincinnati, whose comparison zips were picked
+for the project's dashboard chart, not vetted the way St. Louis's were.
+
+### Diagnostic: which city is driving the pre-trend?
+
+Splitting the event study out by city (still each against its own
+comparison group, no pooling) should show whether the drift is
+broad-based or concentrated in the two less-vetted cities.
+
+```{r per-city-diagnostic}
+kc_es <- feols(HomeValue ~ i(event_month, treated, ref = -1) | RegionName + Date,
+               cluster = ~RegionName, data = kc_panel)
+iplot(kc_es, main = "Kansas City: Event-Study Estimates (Streetcar, May 2016)",
+      xlab = "Months relative to opening", ylab = "Treated - comparison gap (USD)")
+
+cincy_es <- feols(HomeValue ~ i(event_month, treated, ref = -1) | RegionName + Date,
+                   cluster = ~RegionName, data = cincy_panel)
+iplot(cincy_es, main = "Cincinnati: Event-Study Estimates (Connector, Sep 2016)",
+      xlab = "Months relative to opening", ylab = "Treated - comparison gap (USD)")
+```
+
+**Cincinnati is driving almost all of it.** Its pre-period gap opens
+around -\$60k thirty-six months before the Connector's opening and
+closes smoothly to zero right at treatment -- a much larger, cleaner
+version of the pooled drift. Kansas City shows a milder version of the
+same pattern (roughly a \$10k pre-period close, well within its wide
+confidence intervals); St. Louis, again, doesn't.
+
+One caution on interpretation: this 36-month pre-window can't actually
+adjudicate whether that drift is anticipation or an older, independent
+trend. It runs from roughly September 2013 to the Connector's September
+2016 opening -- which is close to when the project's funding was locked
+in and construction became real, not some arbitrary earlier cutoff. That
+means every point in this window already sits inside the "this is
+happening" era; there's no flat, pre-momentum baseline here to compare
+against. A drift that starts right when the window starts is equally
+consistent with (a) anticipation of a now-credible project and (b) an
+independent trend that predates the window entirely and simply continued
+through it. Telling those apart would need a longer pre-period reaching
+back before the project had real momentum (roughly 2009-2011): a gap
+that's already wide back then points to (b); one that's flat until
+momentum picks up around 2013 is more consistent with (a). That check
+isn't run here, but the data to run it exists.
+
+Priors still lean toward (b), for what it's worth: a
+streetcar/circulator isn't the kind of large capital project (a new
+subway line, say) that real estate markets are known to price in years
+ahead of completion, and downtown/Over-the-Rhine was independently one
+of Cincinnati's most visible revitalization stories of the decade
+regardless of the Connector.
+
+What the data says more cleanly, without needing to settle that
+question: the post-opening coefficients show no additional departure
+from wherever the pre-existing trend already had prices headed. Whatever
+was moving 45202's home values before September 2016 -- neighborhood
+revival, anticipation, or both -- the Connector's actual opening doesn't
+appear to have added anything on top of it. Same pattern, more mildly,
+in Kansas City. A combined quarter-billion dollars in construction cost
+across these two projects showing no detectable marginal effect on the
+home values they were partly justified by is worth sitting with on its
+own, independent of how the pre-trend itself is explained.
+
+## Discussion
+
+A few limitations worth stating plainly rather than glossing over:
+
+- **The pooled model fails its own parallel-trends check, and Cincinnati
+  is why.** The per-city diagnostic traces the pooled pre-trend almost
+  entirely to Cincinnati (a \~\$60k pre-period gap closing smoothly to
+  zero right at the Connector's opening), with a milder echo in Kansas
+  City; St. Louis alone is comparatively flat. That undercuts the pooled
+  DiD estimate (\$9,735, not significant at conventional levels anyway)
+  as evidence of a real circulator effect -- it looks much more like
+  45202 (downtown/Over-the-Rhine) riding Cincinnati's broader,
+  independent 2010s revitalization wave, which plausibly helped motivate
+  building the Connector there in the first place rather than resulting
+  from it. This is arguably the most useful finding in this document:
+  not a headline effect size, but a demonstration of why checking
+  parallel trends explicitly (rather than eyeballing a line chart, as
+  the original paper did) matters -- a naive two-period DiD would have
+  reported the \$9,735 figure with no way to know it was confounded, and
+  would have had no way to catch that Cincinnati's own treated zip was
+  already moving well before treatment.
+- **Small N.** Even pooled, this is 6 treated zips and 10 comparison
+  zips across three cities -- still a small sample for a panel
+  regression, and results will be sensitive to exactly which zips are in
+  each group.
+- **Comparison-zip vetting is uneven, but a better comparison group
+  likely wouldn't fully fix Cincinnati.** St. Louis's group has a real
+  argument behind it; Kansas City's and Cincinnati's had a one-pass
+  county-level check. That's worth fixing regardless, but Cincinnati's
+  problem looks more like treatment-placement (the treated zip itself
+  was already on a different trajectory) than a fixable comparison-zip
+  mismatch alone.
+- **Pooling assumes a common effect.** A heritage trolley, a modern
+  streetcar, and a rebranded circulator bus are not the same
+  intervention, and St. Louis/Kansas City/Cincinnati are not the same
+  housing market. The pooled estimate is an average effect across three
+  genuinely different cases, which is a real assumption, not a neutral
+  default.
+- **This is not the "stacked DiD" of Cengiz et al. (2019) in the strict
+  sense** -- that design exists to handle a shared pool of control units
+  reused across staggered treatment cohorts, which isn't the situation
+  here since each city's units are entirely its own. Worth being precise
+  about that distinction rather than borrowing the name without the
+  matching problem.
+
+## Conclusion: was it worth it?
+
+I want to be upfront that this section is opinion, not something the
+regression itself proves -- but it's the opinion this analysis leaves me
+with, and I think it's worth stating plainly rather than hiding behind
+hedged academic language.
+
+None of these three projects shows a statistically detectable increase
+in nearby home values, and where there's a large-looking pre/post gap
+(Cincinnati, mildly Kansas City), the evidence points to a pre-existing
+trend the project didn't add to, not an effect of the project itself.
+That's one of the two headline justifications these projects are usually
+sold on -- the other being ridership, i.e., actual transportation
+utility -- and on that count the picture is mixed but not encouraging
+for two of the three:
+
+- **St. Louis's Delmar Loop Trolley** (\$51M to build) carried roughly
+  12,000 riders across its entire 2024 season -- less than a single
+  week's ridership on MetroBus's busiest route ([KMOV, Nov.
+  2024](https://www.firstalert4.com/2024/11/11/loop-trolley-ends-season-operating-within-budget-with-44-percent-increase-ridership/);
+  [MetroBus systemwide
+  ridership](https://en.wikipedia.org/wiki/MetroBus_(St._Louis))).
+- **The Cincinnati Bell Connector** (\$148M) hit a record \~1.2 million
+  riders in 2024 (\~3,300/day averaged across the year), but SORTA's
+  single busiest bus route alone carries roughly 9,700 weekday boardings
+  -- more than double the streetcar's daily average across its whole
+  loop ([Connector
+  ridership](https://en.wikipedia.org/wiki/Connector_(Cincinnati))).
+- **The KC Streetcar** (\$102M for the original starter line) actually
+  complicates this story: 2025 ridership (\~2.16 million/year,
+  \~5,900/day) now exceeds a comparable busy RideKC bus route on a
+  per-day basis ([KC Streetcar
+  ridership](https://en.wikipedia.org/wiki/KC_Streetcar)). By raw
+  ridership, it's a genuine transit success relative to St. Louis and
+  Cincinnati -- but matching a bus route's ridership at roughly
+  \$46M/mile (and a since-built extension north of \$100M/mile) only
+  pencils out as a good use of money if there's something *besides*
+  moving the same number of people a bus already moves -- the usual
+  pitch being exactly the property-value uplift this analysis is built
+  to detect. That uplift isn't there for KC either. Good ridership
+  without a value externality just means you paid a rail premium for
+  what a bus route already does. A sharper cut on the same point, using
+  the metric that actually measures reliance rather than total trips:
+  2016-2020 Census commuting data put bus at roughly 8,500 primary
+  work-commuters in the KC metro against about 250 for the streetcar --
+  a 34-to-1 gap -- while KCATA's entire annual operating budget
+  (\$57.6M) ran at about a fifth of the \$351M streetcar extension that
+  broke ground the same year. I wrote about this specific tension for
+  the Show-Me Institute in 2022, well before this analysis existed:
+  ["As Kansas City's Streetcar Expands, Its Buses
+  Suffer"](https://showmeinstitute.org/article/transportation/as-kansas-citys-streetcar-expands-its-buses-suffer/).
+  It's a good sign, not a coincidence, that a rigorous causal analysis
+  four years later lands in the same place a much simpler
+  descriptive comparison did.
+
+So the ridership case for calling these "real transit" rather than a
+civic amenity is weak for St. Louis and Cincinnati, mixed-to-positive
+for Kansas City. But the property-value case -- tested directly here --
+comes back null for all three, including Kansas City. If a marginal
+transit dollar is supposed to either move people or move property
+values, and a combined several hundred million dollars across these
+three projects didn't clearly do either relative to just running more
+buses on routes that already carry many times the ridership, that's a
+real strike against how that money was spent, not just an academic null
+result to shrug off. I'd rather see that dollar go toward frequency and
+coverage on the bus network already doing the actual work of moving
+people in these cities.
+
+(Ridership and cost figures above are from Wikipedia's sourced ridership
+tables and local news coverage, current as of late 2025/2025-season
+reporting where available; route-level bus comparisons in particular are
+order-of-magnitude estimates from secondary sources and are worth a
+final check against each transit agency's own published ridership
+reports before this goes out publicly. The KC commute-mode-share figures
+are 2016-2020 American Community Survey 5-year estimates, table B08006,
+as cited in the linked 2022 Show-Me Institute piece.)
+
+## Note on results
+
+This notebook has been rendered and reviewed -- see the Conclusion above
+for the headline takeaway, and the per-city diagnostic in Part 2 for why
+the pooled coefficient shouldn't be read at face value. If the
+underlying zip lists, windows, or opening dates change later, re-check
+the event-study plots for new pre-trend issues before trusting any point
+estimate that comes out of a re-render; a clean-looking coefficient
+table next to a sloped pre-trend plot is exactly the failure mode this
+document was built to catch.

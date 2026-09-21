@@ -1,0 +1,33 @@
+# Large source/derived data -- see data/README.md for how to get or
+# regenerate these. None of them are needed to view the rendered
+# analysis or read the code.
+/zip_data.csv
+/mo_combined.rds
+/oh_combined.rds
+/shiny_app_data.rds
+/dashboard/mo_combined.rds
+/dashboard/oh_combined.rds
+/dashboard/shiny_app_data.rds
+/dashboard/urbancircluators.Rdata
+/dashboard/urbancirculators2.Rdata
+/urbancircluators.Rdata
+/urbancirculators2.Rdata
+/data/zip_data.csv
+
+# Pre-reorg duplicates left at repo root -- the tracked copies live in
+# /analysis, /dashboard, /legacy, /data instead.
+/analysis.qmd
+/analysis.html
+/analysis.txt
+/analysis_stripped.html
+/app.R
+/zip_cleaning.R
+/zip_cleaning_archive_*.R
+/regression.R
+/Final Paper.docx
+/stl_zips.csv
+
+# R housekeeping
+.Rhistory
+.Rproj.user/
+*.Rproj
