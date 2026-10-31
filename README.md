@@ -15,7 +15,7 @@ which is what the original 2023 version of this analysis used, can't catch.
 
 **[Read the full analysis](./analysis/analysis.html)** <!-- once this repo is on GitHub, swap this for an htmlpreview.github.io link (or a GitHub Pages link) so it renders in-browser instead of downloading -->
 
-**[Live dashboard](#)** <!-- add the shinyapps.io link here after deploying -->
+**[Live dashboard](https://quinrizer.shinyapps.io/UrbanCirculators_2026/)** 
 
 ## How this evolved
 
